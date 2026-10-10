@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tiny Tunes</title>
+<style>
+  :root {
+    --bg: #f4f2ee; --card: #ffffff; --text: #1d1c1a; --muted: #6b6760;
+    --accent: #d9552b; --line: #e3dfd8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151413; --card: #1f1e1c; --text: #f1eee8; --muted: #9a958c; --accent: #f07a50; --line: #2e2c29; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: var(--bg); color: var(--text);
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 16px;
+  }
+  .player { width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 24px; }
+  canvas { width: 100%; height: 120px; display: block; border-radius: 12px; background: var(--bg); }
+  h1 { font-size: 20px; margin: 20px 0 2px; }
+  .artist { color: var(--muted); margin: 0 0 16px; font-size: 14px; }
+  .progress { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); }
+  .times { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .controls { display: flex; justify-content: center; align-items: center; gap: 20px; margin: 16px 0; }
+  button { border: 0; background: none; color: var(--text); cursor: pointer; font-size: 22px; width: 44px; height: 44px; border-radius: 50%; }
+  button:hover { background: var(--line); }
+  #play { width: 60px; height: 60px; background: var(--accent); color: #fff; font-size: 24px; }
+  #play:hover { filter: brightness(1.08); background: var(--accent); }
+  .volume { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; }
+  .volume input { flex: 1; accent-color: var(--accent); }
+  ul { list-style: none; padding: 0; margin: 20px 0 0; border-top: 1px solid var(--line); }
+  li { display: flex; justify-content: space-between; padding: 10px 4px; border-bottom: 1px solid var(--line); cursor: pointer; font-size: 14px; }
+  li:hover { color: var(--accent); }
+  li.active { color: var(--accent); font-weight: 600; }
+  li span:last-child { color: var(--muted); font-weight: 400; }
+</style>
+</head>
+<body>
+<main class="player">
+  <canvas id="viz" width="660" height="240"></canvas>
+  <h1 id="title">—</h1>
+  <p class="artist" id="artist">—</p>
+  <div class="progress"><div id="bar"></div></div>
+  <div class="times"><span id="cur">0:00</span><span id="dur">0:00</span></div>
+  <div class="controls">
+    <button id="prev" aria-label="Previous">⏮</button>
+    <button id="play" aria-label="Play">▶</button>
+    <button id="next" aria-label="Next">⏭</button>
+  </div>
+  <label class="volume">🔈 <input id="vol" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+  <ul id="list"></ul>
+</main>
+
+<script>
+// Songs are synthesized with the Web Audio API, so no audio files are needed.
+// Each note: [midi note (null = rest), length in beats]
+const SONGS = [
+  { title: "Twinkle Twinkle", artist: "Traditional", bpm: 110, wave: "triangle",
+    notes: [[60,1],[60,1],[67,1],[67,1],[69,1],[69,1],[67,2],[65,1],[65,1],[64,1],[64,1],[62,1],[62,1],[60,2],
+            [67,1],[67,1],[65,1],[65,1],[64,1],[64,1],[62,2],[67,1],[67,1],[65,1],[65,1],[64,1],[64,1],[62,2]] },
+  { title: "Ode to Joy", artist: "L. van Beethoven", bpm: 130, wave: "sine",
+    notes: [[64,1],[64,1],[65,1],[67,1],[67,1],[65,1],[64,1],[62,1],[60,1],[60,1],[62,1],[64,1],[64,1.5],[62,0.5],[62,2],
+            [64,1],[64,1],[65,1],[67,1],[67,1],[65,1],[64,1],[62,1],[60,1],[60,1],[62,1],[64,1],[62,1.5],[60,0.5],[60,2]] },
+  { title: "Arcade Run", artist: "Tiny Tunes", bpm: 150, wave: "square",
+    notes: [[72,0.5],[76,0.5],[79,0.5],[84,0.5],[79,0.5],[76,0.5],[72,1],[74,0.5],[77,0.5],[81,0.5],[86,0.5],[81,0.5],[77,0.5],[74,1],
+            [71,0.5],[74,0.5],[79,0.5],[83,0.5],[79,0.5],[74,0.5],[71,1],[72,0.5],[null,0.5],[72,0.5],[79,0.5],[84,2]] },
+  { title: "Sunset Drift", artist: "Tiny Tunes", bpm: 80, wave: "sawtooth",
+    notes: [[57,2],[60,1],[64,1],[62,2],[59,2],[55,2],[59,1],[62,1],[60,3],[null,1],[53,2],[57,1],[60,1],[59,2],[55,2],[57,4]] },
+];
+
+const $ = id => document.getElementById(id);
+let ctx, master, analyser, voices = [], index = 0, playing = false, startedAt = 0, timer;
+
+const freq = m => 440 * Math.pow(2, (m - 69) / 12);
+const length = s => s.notes.reduce((t, [, b]) => t + b, 0) * 60 / s.bpm;
+const fmt = t => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+
+function initAudio() {
+  if (ctx) return;
+  ctx = new AudioContext();
+  master = ctx.createGain();
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 256;
+  master.gain.value = $("vol").value;
+  master.connect(analyser).connect(ctx.destination);
+  draw();
+}
+
+function schedule(song) {
+  const beat = 60 / song.bpm;
+  let t = ctx.currentTime + 0.05;
+  startedAt = t;
+  for (const [note, beats] of song.notes) {
+    const dur = beats * beat;
+    if (note !== null) {
+      const osc = ctx.createOscillator(), env = ctx.createGain();
+      osc.type = song.wave;
+      osc.frequency.value = freq(note);
+      // Short attack/release envelope to avoid clicks
+      env.gain.setValueAtTime(0, t);
+      env.gain.linearRampToValueAtTime(0.25, t + 0.02);
+      env.gain.setValueAtTime(0.25, t + dur * 0.8);
+      env.gain.linearRampToValueAtTime(0, t + dur * 0.95);
+      osc.connect(env).connect(master);
+      osc.start(t);
+      osc.stop(t + dur);
+      voices.push(osc);
+    }
+    t += dur;
+  }
+}
+
+function stopVoices() {
+  voices.forEach(v => { try { v.stop(); } catch {} });
+  voices = [];
+}
+
+function play() {
+  initAudio();
+  ctx.resume();
+  stopVoices();
+  schedule(SONGS[index]);
+  playing = true;
+  $("play").textContent = "⏸";
+  $("play").setAttribute("aria-label", "Pause");
+  clearInterval(timer);
+  timer = setInterval(tick, 100);
+}
+
+function pause() {
+  stopVoices();
+  playing = false;
+  clearInterval(timer);
+  $("play").textContent = "▶";
+  $("play").setAttribute("aria-label", "Play");
+}
+
+function tick() {
+  const total = length(SONGS[index]);
+  const elapsed = Math.max(0, ctx.currentTime - startedAt);
+  $("cur").textContent = fmt(Math.min(elapsed, total));
+  $("bar").style.width = Math.min(100, elapsed / total * 100) + "%";
+  if (elapsed >= total + 0.3) load(index + 1, true); // auto-advance
+}
+
+function load(i, autoplay = playing) {
+  index = (i + SONGS.length) % SONGS.length;
+  const s = SONGS[index];
+  $("title").textContent = s.title;
+  $("artist").textContent = s.artist;
+  $("dur").textContent = fmt(length(s));
+  $("cur").textContent = "0:00";
+  $("bar").style.width = "0";
+  document.querySelectorAll("#list li").forEach((li, j) => li.classList.toggle("active", j === index));
+  autoplay ? play() : pause();
+}
+
+function draw() {
+  const c = $("viz"), g = c.getContext("2d");
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent");
+  (function frame() {
+    requestAnimationFrame(frame);
+    analyser.getByteFrequencyData(data);
+    g.clearRect(0, 0, c.width, c.height);
+    g.fillStyle = accent;
+    const bars = 48, w = c.width / bars;
+    for (let i = 0; i < bars; i++) {
+      const h = Math.max(4, data[i] / 255 * c.height);
+      g.fillRect(i * w + 2, c.height - h, w - 4, h);
+    }
+  })();
+}
+
+SONGS.forEach((s, i) => {
+  const li = document.createElement("li");
+  li.innerHTML = `<span>${s.title}</span><span>${fmt(length(s))}</span>`;
+  li.onclick = () => load(i, true);
+  $("list").appendChild(li);
+});
+
+$("play").onclick = () => (playing ? pause() : play());
+$("next").onclick = () => load(index + 1);
+$("prev").onclick = () => load(index - 1);
+$("vol").oninput = e => master && (master.gain.value = e.target.value);
+document.addEventListener("keydown", e => {
+  if (e.code === "Space" && e.target.tagName !== "INPUT") { e.preventDefault(); $("play").click(); }
+});
+
+load(0, false);
+</script>
+</body>
+</html>
